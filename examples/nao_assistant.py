@@ -3,8 +3,8 @@
 """
 NAO AI Assistant - Listen, Think, Speak
 
-NAO listens to your question using its microphone, sends audio to 
-OpenAI Whisper for transcription, gets a GPT response, and speaks it back.
+The laptop listens to your question using its microphone, sends audio to 
+OpenAI Whisper for transcription, gets a GPT response, and NAO speaks it back.
 
 Usage:
     python2 nao_assistant.py [robot_ip]
@@ -15,26 +15,18 @@ Setup:
     1. Add to your .env file:
        NAO_IP_ADDRESS=192.168.1.100
        OPENAI_API_KEY=sk-your-api-key-here
-       NAO_PASSWORD=nao
     
-    2. Install file transfer tool (needed to copy audio files from NAO):
+    2. Install pyaudio for audio recording:
        
        macOS:
-         brew install hudochenkov/sshpass/sshpass
+         brew install portaudio
+         pip install pyaudio
        
        Linux (Ubuntu/Debian):
-         sudo apt-get install sshpass
+         sudo apt-get install portaudio19-dev python-pyaudio
        
        Windows:
-         Option A - Use PuTTY's pscp:
-           1. Download PuTTY from https://www.putty.org/
-           2. Add PuTTY folder to PATH
-           (Script will auto-detect and use pscp on Windows)
-         
-         Option B - Use WSL (Windows Subsystem for Linux):
-           1. Install WSL: wsl --install
-           2. In WSL terminal: sudo apt-get install sshpass
-           3. Run this script from WSL
+         pip install pyaudio
 """
 
 from __future__ import print_function
@@ -46,6 +38,19 @@ import tempfile
 import subprocess
 import platform
 import traceback
+# Import wave module - clear cache if needed to avoid conflicts with old wave.py
+if 'wave' in sys.modules:
+    wave_mod = sys.modules['wave']
+    wave_file = getattr(wave_mod, '__file__', '')
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # If it's the local wave module (from examples directory), remove it
+    if wave_file and script_dir in wave_file:
+        print("[DEBUG] Removing cached local wave module: %s" % wave_file)
+        del sys.modules['wave']
+import wave
+# Verify we got the right module
+if not hasattr(wave, 'open'):
+    raise ImportError("Failed to import standard library wave module. Got: %s" % getattr(wave, '__file__', 'unknown'))
 
 # Python 2/3 compatibility for HTTP requests
 try:
@@ -65,6 +70,14 @@ except ImportError:
     print("Run: source setup_env.sh")
     sys.exit(1)
 
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
+    print("Warning: pyaudio not found. Audio recording will not work.")
+    print("Install with: pip install pyaudio")
+
 
 # Configuration
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
@@ -79,10 +92,6 @@ Be friendly, warm, and occasionally add a bit of robot humor.
 If asked about your capabilities, mention that you can move, dance, wave, and have conversations."""
 
 
-def get_nao_password():
-    """Get NAO SSH password from environment."""
-    env_vars = load_env_file()
-    return env_vars.get('NAO_PASSWORD', 'nao')  # Default NAO password is 'nao'
 
 
 def is_windows():
@@ -99,17 +108,24 @@ class NaoAssistant:
         self.api_key = get_openai_api_key()
         self.model = get_openai_model()
         self.conversation_history = []
-        self.nao_password = get_nao_password()
+        
+        # Check pyaudio availability
+        if not PYAUDIO_AVAILABLE:
+            print("ERROR: pyaudio is required for audio recording.")
+            print("Install with: pip install pyaudio")
+            sys.exit(1)
         
         # Connect to NAO services
         print("Connecting to NAO at %s..." % robot_ip)
         self.tts = ALProxy("ALTextToSpeech", robot_ip, port)
         self.memory = ALProxy("ALMemory", robot_ip, port)
         self.leds = ALProxy("ALLeds", robot_ip, port)
-        self.audio_recorder = ALProxy("ALAudioRecorder", robot_ip, port)
         
         # Configure TTS
         self.tts.setParameter("speed", 85)
+        
+        # Initialize pyaudio
+        self.audio = pyaudio.PyAudio()
         
         print("Connected successfully!")
     
@@ -138,152 +154,187 @@ class NaoAssistant:
         print("NAO: %s" % text)
         self.tts.say(text)
     
-    def record_audio_on_nao(self, duration=RECORD_DURATION):
-        """
-        Record audio from NAO's microphone.
-        The file is saved ON THE ROBOT at /home/nao/recording.wav
-        
-        Returns the remote path on NAO.
-        """
-        remote_path = "/home/nao/recording.wav"
-        
-        # Stop any existing recording first
+    def list_audio_devices(self):
+        """List available audio input devices for debugging."""
+        print("\n[DEBUG] Available audio input devices:")
+        print("-" * 60)
         try:
-            self.audio_recorder.stopMicrophonesRecording()
-        except:
-            pass
-        time.sleep(0.3)
+            default_input = self.audio.get_default_input_device_info()
+            print("Default input device:")
+            print("  Index: %d" % default_input['index'])
+            # Handle encoding issues with device names
+            try:
+                device_name = default_input['name'].encode('ascii', 'replace').decode('ascii')
+            except:
+                device_name = str(default_input['name']).encode('ascii', 'replace').decode('ascii')
+            print("  Name: %s" % device_name)
+            print("  Channels: %d" % default_input['maxInputChannels'])
+            print("  Sample Rate: %.0f" % default_input['defaultSampleRate'])
+            print("-" * 60)
+            
+            print("\nAll input devices:")
+            for i in range(self.audio.get_device_count()):
+                info = self.audio.get_device_info_by_index(i)
+                if info['maxInputChannels'] > 0:
+                    try:
+                        device_name = info['name'].encode('ascii', 'replace').decode('ascii')
+                    except:
+                        device_name = str(info['name']).encode('ascii', 'replace').decode('ascii')
+                    print("  [%d] %s (Channels: %d)" % (i, device_name, info['maxInputChannels']))
+        except Exception as e:
+            print("[DEBUG] Error listing devices: %s" % str(e))
+        print("-" * 60 + "\n")
+    
+    def record_audio_on_laptop(self, duration=RECORD_DURATION):
+        """
+        Record audio from laptop's microphone.
+        Returns the local path to the recorded WAV file.
+        """
+        if not PYAUDIO_AVAILABLE:
+            print("ERROR: pyaudio not available. Cannot record audio.")
+            return None
         
         print("[DEBUG] Recording: Starting...")
         print("Recording for %d seconds..." % duration)
         
-        # Start recording
-        # Parameters: filename, format, sampleRate, channels
-        # channels: [front, rear, left, right] microphones
-        self.audio_recorder.startMicrophonesRecording(
-            remote_path,
-            "wav",
-            SAMPLE_RATE,
-            [1, 0, 0, 0]  # Front microphone only
-        )
+        # List available devices for debugging
+        self.list_audio_devices()
         
-        # Wait for recording duration
-        time.sleep(duration)
-        
-        # Stop recording
-        self.audio_recorder.stopMicrophonesRecording()
-        print("Recording complete. File saved on NAO: %s" % remote_path)
-        
-        # Wait a bit for file to be fully written
-        time.sleep(0.5)
-        
-        return remote_path
-    
-    def copy_file_from_nao(self, remote_path):
-        """
-        Copy a file from NAO to local machine using SCP.
-        Supports both Unix (scp/sshpass) and Windows (pscp).
-        
-        Returns local path to the copied file.
-        """
+        # Create temporary file for recording
         local_path = tempfile.mktemp(suffix='.wav')
         
-        print("[DEBUG] Audio Transfer: Copying from NAO...")
-        print("[DEBUG] Audio Transfer: Remote: %s" % remote_path)
-        print("[DEBUG] Audio Transfer: Local: %s" % local_path)
+        # Audio recording parameters
+        chunk = 1024
+        format = pyaudio.paInt16
+        channels = 1  # Mono
+        sample_rate = SAMPLE_RATE
         
-        if is_windows():
-            return self._copy_file_windows(remote_path, local_path)
-        else:
-            return self._copy_file_unix(remote_path, local_path)
-    
-    def _copy_file_unix(self, remote_path, local_path):
-        """Copy file using scp/sshpass on Unix/macOS."""
+        stream = None
         try:
-            # First, try with sshpass (most reliable for automation)
-            print("[DEBUG] Audio Transfer: Trying sshpass + scp...")
-            cmd_with_pass = [
-                'sshpass', '-p', self.nao_password,
-                'scp',
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'UserKnownHostsFile=/dev/null',
-                'nao@%s:%s' % (self.robot_ip, remote_path),
-                local_path
-            ]
+            # Get default input device
+            try:
+                default_device = self.audio.get_default_input_device_info()
+                device_index = default_device['index']
+                # Handle encoding issues with device names
+                try:
+                    device_name = default_device['name'].encode('ascii', 'replace').decode('ascii')
+                except:
+                    device_name = str(default_device['name']).encode('ascii', 'replace').decode('ascii')
+                print("[DEBUG] Using default input device: %s (index %d)" % (device_name, device_index))
+            except Exception as e:
+                print("[DEBUG] Warning: Could not get default input device: %s" % str(e))
+                print("[DEBUG] Trying to use device index 0...")
+                device_index = None
             
-            result = subprocess.call(
-                cmd_with_pass, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE
-            )
+            # Open audio stream
+            print("[DEBUG] Opening audio stream...")
+            stream_params = {
+                'format': format,
+                'channels': channels,
+                'rate': sample_rate,
+                'input': True,
+                'frames_per_buffer': chunk
+            }
             
-            if result == 0 and os.path.exists(local_path):
-                file_size = os.path.getsize(local_path)
-                print("[DEBUG] Audio Transfer: Success! (%d bytes)" % file_size)
-                return local_path
+            if device_index is not None:
+                stream_params['input_device_index'] = device_index
             
-            # Fallback: try without sshpass (if SSH keys are set up)
-            print("[DEBUG] Audio Transfer: Trying scp without password...")
-            cmd_no_pass = [
-                'scp',
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'BatchMode=yes',
-                'nao@%s:%s' % (self.robot_ip, remote_path),
-                local_path
-            ]
+            stream = self.audio.open(**stream_params)
+            print("[DEBUG] Audio stream opened successfully!")
             
-            result = subprocess.call(
-                cmd_no_pass,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            print("\n" + "=" * 60)
+            print("Recording... (speak now)")
+            print("=" * 60)
+            frames = []
             
-            if result == 0 and os.path.exists(local_path):
-                file_size = os.path.getsize(local_path)
-                print("[DEBUG] Audio Transfer: Success! (%d bytes)" % file_size)
-                return local_path
+            # Record for specified duration
+            num_chunks = int(sample_rate / chunk * duration)
+            for i in range(0, num_chunks):
+                try:
+                    data = stream.read(chunk, exception_on_overflow=False)
+                    frames.append(data)
+                    # Show progress
+                    if (i + 1) % 10 == 0:
+                        progress = int((i + 1) * 100.0 / num_chunks)
+                        print("[%d%%] Recording..." % progress)
+                except Exception as e:
+                    print("[DEBUG] Error reading audio chunk: %s" % str(e))
+                    break
             
-            print("[DEBUG] Audio Transfer: FAILED")
-            print("Make sure sshpass is installed:")
-            print("  macOS: brew install hudochenkov/sshpass/sshpass")
-            print("  Linux: sudo apt-get install sshpass")
+            print("Recording complete.")
+            
+            # Stop and close stream
+            if stream:
+                stream.stop_stream()
+                stream.close()
+            
+            if len(frames) == 0:
+                print("[DEBUG] ERROR: No audio frames recorded!")
+                return None
+            
+            # Save to WAV file
+            print("[DEBUG] Saving audio file...")
+            # Import wave module (standard library)
+            # Clear any cached wave module to avoid conflicts with old .pyc files
+            import sys
+            if 'wave' in sys.modules:
+                wave_mod = sys.modules['wave']
+                wave_file = getattr(wave_mod, '__file__', '')
+                # If it's not the standard library wave, remove it
+                if wave_file and ('site-packages' not in wave_file and 'lib' not in wave_file and 'python' not in wave_file.lower()):
+                    print("[DEBUG] Removing cached wave module (was: %s)" % wave_file)
+                    del sys.modules['wave']
+            
+            import wave
+            # Verify it's the correct module
+            if not hasattr(wave, 'open'):
+                raise AttributeError("wave module does not have 'open' - wrong module imported! File: %s" % getattr(wave, '__file__', 'N/A'))
+            
+            wf = wave.open(local_path, 'wb')
+            
+            wf.setnchannels(channels)
+            wf.setsampwidth(self.audio.get_sample_size(format))
+            wf.setframerate(sample_rate)
+            wf.writeframes(b''.join(frames))
+            wf.close()
+            
+            file_size = os.path.getsize(local_path)
+            print("[DEBUG] Recording: File saved (%d bytes)" % file_size)
+            
+            if file_size < 1000:
+                print("[DEBUG] WARNING: File seems very small. Recording may have failed.")
+                return None
+            
+            return local_path
+            
+        except OSError as e:
+            print("[DEBUG] Recording: OSError - %s" % str(e))
+            if "Invalid sample rate" in str(e) or "Invalid number of channels" in str(e):
+                print("[DEBUG] The microphone may not support the requested sample rate or channels.")
+                print("[DEBUG] Try checking your microphone settings.")
+            elif "Permission denied" in str(e) or "Access is denied" in str(e):
+                print("[DEBUG] Microphone permission denied. Please check:")
+                print("[DEBUG]   - Windows: Settings > Privacy > Microphone")
+                print("[DEBUG]   - Make sure microphone access is enabled for Python")
+            print("[DEBUG] Recording: Traceback: %s" % traceback.format_exc())
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
             return None
-            
         except Exception as e:
-            print("[DEBUG] Audio Transfer: Error: %s" % str(e))
+            print("[DEBUG] Recording: Error: %s" % str(e))
+            print("[DEBUG] Recording: Traceback: %s" % traceback.format_exc())
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
             return None
     
-    def _copy_file_windows(self, remote_path, local_path):
-        """Copy file using pscp (PuTTY) on Windows."""
-        try:
-            print("[DEBUG] Audio Transfer: Trying pscp (PuTTY)...")
-            cmd = [
-                'pscp',
-                '-pw', self.nao_password,
-                '-batch',
-                'nao@%s:%s' % (self.robot_ip, remote_path),
-                local_path
-            ]
-            
-            result = subprocess.call(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            
-            if result == 0 and os.path.exists(local_path):
-                file_size = os.path.getsize(local_path)
-                print("[DEBUG] Audio Transfer: Success! (%d bytes)" % file_size)
-                return local_path
-            
-            print("[DEBUG] Audio Transfer: FAILED")
-            print("Make sure PuTTY is installed and pscp is in PATH.")
-            print("Download from: https://www.putty.org/")
-            return None
-            
-        except Exception as e:
-            print("[DEBUG] Audio Transfer: Error: %s" % str(e))
-            return None
     
     def transcribe_with_whisper(self, audio_path):
         """
@@ -348,6 +399,21 @@ class NaoAssistant:
         """Get response from ChatGPT."""
         print("[DEBUG] GPT: Processing message: \"%s\"" % user_message[:50])
         
+        # Handle Python 2/3 compatibility for unicode strings
+        try:
+            # Python 2
+            unicode_type = unicode
+        except NameError:
+            # Python 3
+            unicode_type = str
+        
+        # Ensure user_message is unicode/str (not bytes)
+        if not isinstance(user_message, unicode_type):
+            try:
+                user_message = user_message.decode('utf-8')
+            except (UnicodeDecodeError, AttributeError):
+                user_message = unicode_type(user_message)
+        
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self.conversation_history)
         messages.append({"role": "user", "content": user_message})
@@ -366,14 +432,26 @@ class NaoAssistant:
         
         try:
             print("[DEBUG] GPT: Sending request...")
+            # Use ensure_ascii=False to preserve unicode characters, then encode to UTF-8
+            json_str = json.dumps(data, ensure_ascii=False)
+            # If it's unicode (Python 2) or str (Python 3), encode to UTF-8 bytes
+            if isinstance(json_str, unicode_type):
+                json_bytes = json_str.encode('utf-8')
+            else:
+                # Already bytes (shouldn't happen with ensure_ascii=False, but handle it)
+                json_bytes = json_str
+            
             request = Request(
                 OPENAI_CHAT_URL,
-                data=json.dumps(data).encode('utf-8'),
+                data=json_bytes,
                 headers=headers
             )
             
             response = urlopen(request, timeout=30)
-            response_data = response.read().decode('utf-8')
+            response_data = response.read()
+            # Decode response
+            if isinstance(response_data, bytes):
+                response_data = response_data.decode('utf-8')
             result = json.loads(response_data)
             
             if 'choices' in result and len(result['choices']) > 0:
@@ -406,36 +484,64 @@ class NaoAssistant:
     
     def is_head_touched(self):
         """Check if any head sensor is touched."""
+        # Try primary sensor paths
         try:
             front = self.memory.getData("Device/SubDeviceList/Head/Touch/Front/Sensor/Value")
             middle = self.memory.getData("Device/SubDeviceList/Head/Touch/Middle/Sensor/Value")
             rear = self.memory.getData("Device/SubDeviceList/Head/Touch/Rear/Sensor/Value")
-            return front > 0.5 or middle > 0.5 or rear > 0.5
-        except:
+            touched = front > 0.5 or middle > 0.5 or rear > 0.5
+            if touched:
+                print("[DEBUG] Head touched! Front: %.2f, Middle: %.2f, Rear: %.2f" % (front, middle, rear))
+            return touched
+        except Exception as e:
+            # Try alternative sensor paths (some NAO models use different paths)
+            try:
+                print("[DEBUG] Primary head touch paths failed, trying alternatives...")
+                # Alternative path format
+                alt_paths = [
+                    "Device/SubDeviceList/Head/Touch/Front/Sensor/Value",
+                    "Device/SubDeviceList/Head/Touch/Middle/Sensor/Value", 
+                    "Device/SubDeviceList/Head/Touch/Rear/Sensor/Value",
+                    "ALMemory/HeadTouch/Front",
+                    "ALMemory/HeadTouch/Middle",
+                    "ALMemory/HeadTouch/Rear"
+                ]
+                for path in alt_paths:
+                    try:
+                        value = self.memory.getData(path)
+                        if value > 0.5:
+                            print("[DEBUG] Head touched via alternative path: %s = %.2f" % (path, value))
+                            return True
+                    except:
+                        continue
+                print("[DEBUG] Error checking head touch: %s" % str(e))
+            except:
+                pass
             return False
     
     def listen_and_respond(self):
-        """Full conversation flow: listen, transcribe, respond."""
+        """
+        Full conversation flow: listen, transcribe, respond.
+        Returns True if user wants to quit, False to continue.
+        """
         
         # Step 1: Visual feedback - listening
         self.set_eye_color('blue')
         self.say("I'm listening")
+        # Give user a moment to start speaking
+        time.sleep(0.5)
         
         try:
-            # Step 2: Record audio on NAO
-            remote_audio_path = self.record_audio_on_nao(duration=RECORD_DURATION)
-            
-            # Step 3: Copy file from NAO to local machine
-            self.set_eye_color('cyan')
-            local_audio_path = self.copy_file_from_nao(remote_audio_path)
+            # Step 2: Record audio on laptop
+            local_audio_path = self.record_audio_on_laptop(duration=RECORD_DURATION)
             
             if not local_audio_path:
                 self.set_eye_color('red')
-                self.say("I couldn't access the recording. Please check the setup.")
+                self.say("I couldn't record audio. Please check your microphone.")
                 self.set_eye_color('white')
-                return
+                return False  # Continue conversation
             
-            # Step 4: Transcribe with Whisper
+            # Step 3: Transcribe with Whisper
             self.set_eye_color('yellow')
             transcription = self.transcribe_with_whisper(local_audio_path)
             
@@ -449,20 +555,31 @@ class NaoAssistant:
                 self.set_eye_color('red')
                 self.say("I couldn't understand what you said. Please try again.")
                 self.set_eye_color('white')
-                return
+                return False  # Continue conversation
             
             print("\nYou said: \"%s\"" % transcription)
             
-            # Step 5: Get GPT response
+            # Check if user wants to quit
+            transcription_lower = transcription.lower().strip()
+            quit_keywords = ['quit', 'exit', 'stop', 'goodbye', 'bye', 'end conversation']
+            if any(keyword in transcription_lower for keyword in quit_keywords):
+                print("[DEBUG] User requested to quit conversation")
+                self.set_eye_color('yellow')
+                self.say("Goodbye! It was nice talking with you.")
+                self.set_eye_color('white')
+                return True  # Signal to stop the conversation loop
+            
+            # Step 4: Get GPT response
             print("Getting GPT response...")
             response = self.get_gpt_response(transcription)
             
-            # Step 6: Speak the response
+            # Step 5: Speak the response
             self.set_eye_color('green')
             self.say(response)
             
             # Reset
             self.set_eye_color('white')
+            return False  # Continue conversation
             
         except Exception as e:
             print("Error in conversation: %s" % str(e))
@@ -470,29 +587,88 @@ class NaoAssistant:
             self.set_eye_color('red')
             self.say("I encountered an error. Please try again.")
             self.set_eye_color('white')
+            return False  # Continue conversation
     
     def run(self):
-        """Main loop - wait for head touch to start conversation."""
+        """Main loop - wait for head touch to start, then continue conversation until user says quit."""
         print("\n" + "=" * 60)
         print("NAO AI Assistant Ready!")
         print("=" * 60)
-        print("\nTouch NAO's head to start talking.")
+        print("\nTouch NAO's head to start the conversation.")
+        print("Say 'quit', 'exit', or 'stop' to end the conversation.")
         print("Press Ctrl+C to exit.")
         print("=" * 60 + "\n")
         
         self.set_eye_color('white')
-        self.say("Hello! Touch my head when you want to talk to me.")
+        self.say("Hello! Touch my head to start our conversation.")
+        
+        # Test head touch sensors on startup
+        print("[DEBUG] Testing head touch sensors...")
+        try:
+            front = self.memory.getData("Device/SubDeviceList/Head/Touch/Front/Sensor/Value")
+            middle = self.memory.getData("Device/SubDeviceList/Head/Touch/Middle/Sensor/Value")
+            rear = self.memory.getData("Device/SubDeviceList/Head/Touch/Rear/Sensor/Value")
+            print("[DEBUG] Head sensors initialized - Front: %.2f, Middle: %.2f, Rear: %.2f" % (front, middle, rear))
+        except Exception as e:
+            print("[DEBUG] WARNING: Could not read head sensors: %s" % str(e))
+            print("[DEBUG] Head touch detection may not work properly.")
+        
+        # Wait for initial head touch
+        print("\nWaiting for head touch to start conversation...")
+        head_touched = False
+        last_touch_time = 0
+        touch_debounce = 1.5  # seconds between touches
         
         try:
-            while True:
+            # Phase 1: Wait for initial head touch
+            while not head_touched:
                 if self.is_head_touched():
-                    self.listen_and_respond()
-                    time.sleep(1)  # Debounce
-                    print("\nTouch my head to talk again...")
+                    current_time = time.time()
+                    if current_time - last_touch_time > touch_debounce:
+                        last_touch_time = current_time
+                        print("\n" + "=" * 60)
+                        print("HEAD TOUCH DETECTED - Starting conversation!")
+                        print("=" * 60)
+                        head_touched = True
+                        # Immediate visual feedback
+                        self.set_eye_color('cyan')
+                        time.sleep(0.2)
                 time.sleep(0.1)
+            
+            # Phase 2: Continuous conversation loop
+            print("\n" + "=" * 60)
+            print("Conversation started! I'm ready to chat.")
+            print("Say 'quit', 'exit', or 'stop' when you want to end the conversation.")
+            print("=" * 60 + "\n")
+            
+            self.set_eye_color('white')
+            self.say("I'm ready! Let's chat.")
+            time.sleep(0.5)
+            
+            # Continuous conversation loop
+            while True:
+                should_quit = self.listen_and_respond()
+                if should_quit:
+                    print("\n" + "=" * 60)
+                    print("Conversation ended by user.")
+                    print("=" * 60)
+                    break
+                
+                # Small delay before next recording
+                time.sleep(0.3)
+                
         except KeyboardInterrupt:
             print("\n\nShutting down...")
             self.say("Goodbye!")
+            self.set_eye_color('white')
+        except Exception as e:
+            print("\n[ERROR] Fatal error in main loop: %s" % str(e))
+            print("[ERROR] Traceback: %s" % traceback.format_exc())
+            self.set_eye_color('red')
+            try:
+                self.say("A fatal error occurred. Shutting down.")
+            except:
+                pass
             self.set_eye_color('white')
 
 
@@ -506,19 +682,15 @@ def print_setup_instructions():
         print("""
 Windows Setup:
 
-1. Install PuTTY (includes pscp for file transfer):
-   - Download from: https://www.putty.org/
-   - Run the installer
-   - Make sure to add PuTTY to your PATH during installation
+1. Install pyaudio for audio recording:
+   pip install pyaudio
    
-   OR use the standalone pscp.exe:
-   - Download pscp.exe from the PuTTY website
-   - Place it in C:\\Windows or add its folder to PATH
+   Note: If installation fails, you may need to install Visual C++ Build Tools
+   or download a pre-built wheel from: https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio
 
 2. Add to your .env file:
    NAO_IP_ADDRESS=192.168.1.100
    OPENAI_API_KEY=sk-your-api-key-here
-   NAO_PASSWORD=nao
 
 3. Run:
    python examples\\nao_assistant.py
@@ -527,13 +699,13 @@ Windows Setup:
         print("""
 macOS Setup:
 
-1. Install sshpass:
-   brew install hudochenkov/sshpass/sshpass
+1. Install pyaudio:
+   brew install portaudio
+   pip install pyaudio
 
 2. Add to your .env file:
    NAO_IP_ADDRESS=192.168.1.100
    OPENAI_API_KEY=sk-your-api-key-here
-   NAO_PASSWORD=nao
 
 3. Run:
    python2 examples/nao_assistant.py
@@ -542,13 +714,12 @@ macOS Setup:
 
 Linux Setup:
 
-1. Install sshpass:
-   sudo apt-get install sshpass
+1. Install pyaudio:
+   sudo apt-get install portaudio19-dev python-pyaudio
 
 2. Add to your .env file:
    NAO_IP_ADDRESS=192.168.1.100
    OPENAI_API_KEY=sk-your-api-key-here
-   NAO_PASSWORD=nao
 
 3. Run:
    python2 examples/nao_assistant.py
@@ -579,10 +750,30 @@ def main():
     print("Model: %s" % get_openai_model())
     print("NAO IP: %s" % robot_ip)
     print("Platform: %s" % platform.system())
+    print("\n[DEBUG] Attempting to connect to NAO...")
     
     # Start the assistant
-    assistant = NaoAssistant(robot_ip)
-    assistant.run()
+    try:
+        assistant = NaoAssistant(robot_ip)
+        print("[DEBUG] Connection successful! Starting main loop...")
+        assistant.run()
+    except Exception as e:
+        print("\n[ERROR] Failed to connect or initialize NAO assistant:")
+        print("[ERROR] %s" % str(e))
+        print("[ERROR] Traceback: %s" % traceback.format_exc())
+        print("\nTroubleshooting:")
+        print("  1. Verify NAO is powered on and connected to the network")
+        print("  2. Check that the IP address is correct: %s" % robot_ip)
+        print("  3. Ensure your firewall allows connections on port 9559")
+        print("  4. Try pinging the robot: ping %s" % robot_ip)
+        sys.exit(1)
+    finally:
+        # Clean up pyaudio
+        try:
+            if 'assistant' in locals() and hasattr(assistant, 'audio'):
+                assistant.audio.terminate()
+        except:
+            pass
 
 
 if __name__ == "__main__":
