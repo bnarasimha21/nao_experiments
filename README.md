@@ -4,39 +4,117 @@
 
 1. **NAO Robot** on the same network as your computer
 2. **Robot IP address** - Press the chest button on the robot to hear it
-
-The PyNAOqi SDK includes its own Python 2.7, so no separate installation is needed!
+3. **PyNAOqi SDK** - Download from [Aldebaran/SoftBank Robotics](https://www.aldebaran.com/en/support)
 
 ---
 
 ## Quick Setup
 
-### Step 1: Configure Environment
+### macOS Setup
+
+#### Step 1: Configure Environment
 
 ```bash
-cd /Users/nbadrinath/Documents/MyGitHub/nao_experiments
+cd /path/to/nao_experiments
 source setup_env.sh
 ```
 
-### Step 2: Verify Setup
+Or manually set environment variables:
+
+```bash
+export PYTHONPATH="/path/to/pynaoqi-python2.7-2.8.6.23-mac64/lib/python2.7/site-packages:$PYTHONPATH"
+export DYLD_LIBRARY_PATH="/path/to/pynaoqi-python2.7-2.8.6.23-mac64/lib:$DYLD_LIBRARY_PATH"
+```
+
+#### Step 2: Verify Setup
 
 ```bash
 python2 test_setup.py
 ```
 
-You should see: `SUCCESS: NAOqi loaded correctly!`
-
-### Step 3: Get Your Robot's IP
-
-Press the **chest button** on NAO once — it will announce its IP address.
-
-### Step 4: Run Your First Script!
+#### Step 3: Run Your First Script
 
 ```bash
-python2 examples/say_hello.py 192.168.1.100
+python2 examples/say_hello.py <robot_ip>
+```
+
+---
+
+### Windows Setup
+
+#### Step 1: Download the Windows SDK
+
+Download `pynaoqi-python2.7-2.8.6.23-win32-vs2015` from the Aldebaran/SoftBank support site.
+
+#### Step 2: Install Python 2.7
+
+1. Download Python 2.7 from [python.org/downloads](https://www.python.org/downloads/release/python-2718/)
+2. Install to `C:\Python27`
+3. Add to PATH: `C:\Python27` and `C:\Python27\Scripts`
+
+#### Step 3: Set Environment Variables
+
+**Option A: Command Prompt (temporary)**
+
+```cmd
+set PYTHONPATH=C:\path\to\pynaoqi-python2.7-2.8.6.23-win32-vs2015\lib\site-packages
+set PATH=%PATH%;C:\path\to\pynaoqi-python2.7-2.8.6.23-win32-vs2015\lib
+```
+
+**Option B: PowerShell (temporary)**
+
+```powershell
+$env:PYTHONPATH = "C:\path\to\pynaoqi-python2.7-2.8.6.23-win32-vs2015\lib\site-packages"
+$env:PATH += ";C:\path\to\pynaoqi-python2.7-2.8.6.23-win32-vs2015\lib"
+```
+
+**Option C: Permanent (System Environment Variables)**
+
+1. Right-click **This PC** → **Properties** → **Advanced system settings**
+2. Click **Environment Variables**
+3. Under **User variables**, click **New**:
+   - Variable name: `PYTHONPATH`
+   - Variable value: `C:\path\to\pynaoqi-python2.7-2.8.6.23-win32-vs2015\lib\site-packages`
+4. Edit **PATH** and add: `C:\path\to\pynaoqi-python2.7-2.8.6.23-win32-vs2015\lib`
+
+#### Step 4: Verify Setup
+
+```cmd
+python test_setup.py
+```
+
+You should see: `SUCCESS: NAOqi loaded correctly!`
+
+#### Step 5: Run Your First Script
+
+```cmd
+python examples\say_hello.py 192.168.1.100
 ```
 
 Replace `192.168.1.100` with your robot's actual IP.
+
+---
+
+### Linux Setup
+
+#### Step 1: Download the Linux SDK
+
+Download `pynaoqi-python2.7-2.8.6.23-linux64` from the Aldebaran/SoftBank support site.
+
+#### Step 2: Set Environment Variables
+
+```bash
+export PYTHONPATH="/path/to/pynaoqi-python2.7-2.8.6.23-linux64/lib/python2.7/site-packages:$PYTHONPATH"
+export LD_LIBRARY_PATH="/path/to/pynaoqi-python2.7-2.8.6.23-linux64/lib:$LD_LIBRARY_PATH"
+```
+
+Add these to `~/.bashrc` for permanent setup.
+
+#### Step 3: Run Scripts
+
+```bash
+python2 examples/say_hello.py <robot_ip>
+```
 
 ---
 
@@ -55,24 +133,20 @@ Replace `192.168.1.100` with your robot's actual IP.
 
 ### Usage Examples
 
+**macOS / Linux:**
 ```bash
-# Make NAO speak
 python2 examples/say_hello.py 192.168.1.100
-
-# Make NAO stand up
 python2 examples/stand_sit.py 192.168.1.100 stand
-
-# Make NAO sit down
-python2 examples/stand_sit.py 192.168.1.100 sit
-
-# Make NAO wave
 python2 examples/wave.py 192.168.1.100
-
-# Make NAO dance
 python2 examples/dance.py 192.168.1.100
+```
 
-# Check sensors
-python2 examples/sensors.py 192.168.1.100
+**Windows:**
+```cmd
+python examples\say_hello.py 192.168.1.100
+python examples\stand_sit.py 192.168.1.100 stand
+python examples\wave.py 192.168.1.100
+python examples\dance.py 192.168.1.100
 ```
 
 ---
@@ -118,7 +192,7 @@ def main(robot_ip, port=9559):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python2 script.py <robot_ip>")
+        print("Usage: python script.py <robot_ip>")
         sys.exit(1)
     
     robot_ip = sys.argv[1]
@@ -131,13 +205,26 @@ if __name__ == "__main__":
 
 ### "Cannot connect to robot"
 - Ensure NAO is powered on and connected to the network
-- Verify the IP address is correct
+- Verify the IP address is correct (press chest button to hear it)
 - Check if your firewall allows connections on port 9559
-- Try pinging the robot: `ping 192.168.1.100`
+- Try pinging the robot: `ping <robot_ip>`
+- Ensure your computer is on the same WiFi network as NAO
 
 ### "Module not found" errors
-- Make sure you ran `source setup_env.sh` first
-- Use `python2` (the SDK's Python), not your system Python
+- Make sure environment variables are set correctly
+- On macOS/Linux: run `source setup_env.sh` first
+- On Windows: verify `PYTHONPATH` is set
+- Use Python 2.7 (not Python 3)
+
+### Windows-specific issues
+- Use backslashes in paths: `examples\say_hello.py`
+- Run Command Prompt as Administrator if permission errors occur
+- Make sure Visual C++ Redistributable 2015 is installed
+
+### macOS-specific issues
+- If you have VPN or Docker running, try disabling them
+- Toggle WiFi off/on to reset network routing
+- On newer macOS, you may need to allow the app in Security settings
 
 ---
 
@@ -147,3 +234,4 @@ if __name__ == "__main__":
 - [Python NAOqi API Reference](http://doc.aldebaran.com/2-8/naoqi/index.html)
 - [ALMotion API](http://doc.aldebaran.com/2-8/naoqi/motion/almotion.html)
 - [ALTextToSpeech API](http://doc.aldebaran.com/2-8/naoqi/audio/altexttospeech.html)
+- [SDK Downloads](https://www.aldebaran.com/en/support)
