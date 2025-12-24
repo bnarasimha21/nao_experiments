@@ -131,22 +131,44 @@ python2 examples/say_hello.py <robot_ip>
 | `examples/leds.py` | Change eye LED colors |
 | `examples/sensors.py` | Read battery, touch sensors, sonar |
 
+### Configuration
+
+**Using .env file (Recommended):**
+
+Create a `.env` file in the project root with your NAO robot's IP address:
+
+```
+NAO_IP_ADDRESS=192.168.68.108
+```
+
+All example scripts will automatically use this IP address. You can still override it by passing the IP as a command-line argument.
+
 ### Usage Examples
 
 **macOS / Linux:**
 ```bash
+# With .env file configured:
+python2 examples/say_hello.py
+python2 examples/stand_sit.py stand
+python2 examples/wave.py
+python2 examples/dance.py
+
+# Or override with command-line argument:
 python2 examples/say_hello.py 192.168.1.100
 python2 examples/stand_sit.py 192.168.1.100 stand
-python2 examples/wave.py 192.168.1.100
-python2 examples/dance.py 192.168.1.100
 ```
 
 **Windows:**
 ```cmd
+# With .env file configured:
+python examples\say_hello.py
+python examples\stand_sit.py stand
+python examples\wave.py
+python examples\dance.py
+
+# Or override with command-line argument:
 python examples\say_hello.py 192.168.1.100
 python examples\stand_sit.py 192.168.1.100 stand
-python examples\wave.py 192.168.1.100
-python examples\dance.py 192.168.1.100
 ```
 
 ---

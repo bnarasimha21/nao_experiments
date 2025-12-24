@@ -15,6 +15,10 @@ Where <action> is one of:
 """
 
 import sys
+import os
+# Add parent directory to path to import nao_utils
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from nao_utils import get_robot_ip
 from naoqi import ALProxy
 
 def main(robot_ip, action, port=9559):
@@ -54,14 +58,25 @@ def main(robot_ip, action, port=9559):
         print("Failed to reach posture.")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python2 stand_sit.py <robot_ip> <action>")
+    robot_ip = get_robot_ip()
+    if not robot_ip:
+        if len(sys.argv) < 2:
+            print("Usage: python stand_sit.py [robot_ip] <action>")
+            print("Or set NAO_IP_ADDRESS in .env file")
+            print("Actions: stand, sit, crouch, lyingback, lyingbelly")
+            print("Example: python stand_sit.py stand")
+            sys.exit(1)
+        robot_ip = sys.argv[1]
+        action = sys.argv[2] if len(sys.argv) > 2 else "stand"
+    else:
+        action = sys.argv[1] if len(sys.argv) > 1 else "stand"
+    
+    if not action:
+        print("Usage: python stand_sit.py [robot_ip] <action>")
         print("Actions: stand, sit, crouch, lyingback, lyingbelly")
-        print("Example: python2 stand_sit.py 192.168.1.100 stand")
         sys.exit(1)
     
-    robot_ip = sys.argv[1]
-    action = sys.argv[2]
+    print("Connecting to NAO at: %s" % robot_ip)
     main(robot_ip, action)
 
 

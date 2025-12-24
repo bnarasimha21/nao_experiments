@@ -9,6 +9,10 @@ Usage:
 """
 
 import sys
+import os
+# Add parent directory to path to import nao_utils
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from nao_utils import get_robot_ip
 import qi
 
 def main(robot_ip, port=9559):
@@ -40,11 +44,13 @@ def main(robot_ip, port=9559):
     print("Done!")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python2 say_hello_web.py <robot_ip>")
+    robot_ip = get_robot_ip()
+    if not robot_ip:
+        print("Usage: python say_hello_web.py [robot_ip]")
+        print("Or set NAO_IP_ADDRESS in .env file")
         sys.exit(1)
     
-    robot_ip = sys.argv[1]
+    print("Connecting to NAO at: %s" % robot_ip)
     main(robot_ip)
 
 
