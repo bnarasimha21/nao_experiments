@@ -38,6 +38,7 @@ import tempfile
 import subprocess
 import platform
 import traceback
+import threading
 # Import wave module - clear cache if needed to avoid conflicts with old wave.py
 if 'wave' in sys.modules:
     wave_mod = sys.modules['wave']
@@ -120,12 +121,24 @@ class NaoAssistant:
         self.tts = ALProxy("ALTextToSpeech", robot_ip, port)
         self.memory = ALProxy("ALMemory", robot_ip, port)
         self.leds = ALProxy("ALLeds", robot_ip, port)
+        self.motion = ALProxy("ALMotion", robot_ip, port)
+        self.posture = ALProxy("ALRobotPosture", robot_ip, port)
         
         # Configure TTS
         self.tts.setParameter("speed", 85)
         
         # Initialize pyaudio
         self.audio = pyaudio.PyAudio()
+        
+        # Wake up robot and ensure it's standing
+        try:
+            self.motion.wakeUp()
+            self.posture.goToPosture("Stand", 0.5)
+            # Set arm stiffness for movements
+            self.motion.setStiffnesses("LArm", 0.8)
+            self.motion.setStiffnesses("RArm", 0.8)
+        except:
+            print("[DEBUG] Warning: Could not wake up robot or set posture")
         
         print("Connected successfully!")
     
@@ -144,15 +157,366 @@ class NaoAssistant:
         hex_color = colors.get(color, 0xFFFFFF)
         self.leds.fadeRGB("FaceLeds", hex_color, 0.3)
     
+    def sanitize_for_nao(self, text):
+        """
+        Keep normal letters (including accents), numbers, punctuation.
+        Remove emoji / high unicode symbols. Keep UTF-8 compatible text.
+        Improved version that handles encoding issues.
+        """
+        if not text:
+            return ""
+        
+        # Handle Python 2/3 compatibility
+        try:
+            unicode_type = unicode
+        except NameError:
+            unicode_type = str
+        
+        # Ensure it's unicode/str
+        if isinstance(text, bytes):
+            text = text.decode('utf-8', errors='replace')
+        elif not isinstance(text, unicode_type):
+            try:
+                text = unicode_type(text)
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                text = text.decode('utf-8', errors='replace') if hasattr(text, 'decode') else unicode_type(text)
+        
+        # Normalize whitespace
+        text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+        
+        # Replace problematic unicode characters with ASCII equivalents
+        replacements = {
+            u'\u2014': '-',  # em dash
+            u'\u2013': '-',  # en dash
+            u'\u2018': "'",  # left single quote
+            u'\u2019': "'",  # right single quote
+            u'\u201c': '"',  # left double quote
+            u'\u201d': '"',  # right double quote
+            u'\u2026': '...',  # ellipsis
+            u'\u00a0': ' ',  # non-breaking space
+            u'\u200b': '',   # zero-width space
+            u'\u200c': '',   # zero-width non-joiner
+            u'\u200d': '',   # zero-width joiner
+        }
+        for unicode_char, ascii_char in replacements.items():
+            text = text.replace(unicode_char, ascii_char)
+        
+        cleaned_chars = []
+        for ch in text:
+            cp = ord(ch)
+            
+            # Filter out common emoji / pictograph ranges
+            if 0x1F300 <= cp <= 0x1FAFF:  # Emoji & pictographs
+                continue
+            if 0x2600 <= cp <= 0x26FF:    # Misc symbols (☀, ☂, etc.)
+                continue
+            if 0x1F600 <= cp <= 0x1F64F:  # Emoticons
+                continue
+            if 0x1F900 <= cp <= 0x1F9FF:  # Supplemental Symbols and Pictographs
+                continue
+            
+            # Keep printable ASCII and common UTF-8 characters
+            # Allow Latin, Cyrillic, Arabic, etc. but filter problematic ones
+            if cp < 0x20 and ch not in [' ', '\t']:  # Control characters (except space/tab)
+                continue
+            
+            cleaned_chars.append(ch)
+        
+        cleaned = "".join(cleaned_chars)
+        # Collapse multiple spaces
+        cleaned = " ".join(cleaned.split())
+        return cleaned.strip()
+    
+    def _ensure_text(self, text):
+        """Ensure text is a proper string for NAO TTS (handles unicode/encoding)."""
+        if text is None:
+            return "I'm sorry, I couldn't process that."
+        
+        # Sanitize the text first
+        text = self.sanitize_for_nao(text)
+        
+        if not text:
+            return "I'm sorry, I couldn't process that."
+        
+        return text
+    
+    def _safe_print(self, message, *args):
+        """Safely print a message, handling encoding issues."""
+        try:
+            # Handle Python 2/3 compatibility
+            try:
+                unicode_type = unicode
+            except NameError:
+                unicode_type = str
+            
+            # Convert args to safe format
+            safe_args = []
+            for arg in args:
+                if isinstance(arg, bytes):
+                    safe_args.append(arg.decode('utf-8', errors='replace'))
+                elif isinstance(arg, unicode_type):
+                    safe_args.append(arg)
+                else:
+                    safe_args.append(str(arg))
+            
+            formatted = message % tuple(safe_args) if safe_args else message
+            print(formatted)
+        except UnicodeEncodeError:
+            # Console can't display some characters, use ASCII-safe version
+            try:
+                safe_message = message.encode('ascii', errors='replace').decode('ascii')
+                safe_args = []
+                for arg in args:
+                    if isinstance(arg, (str, unicode_type)):
+                        safe_args.append(arg.encode('ascii', errors='replace').decode('ascii'))
+                    else:
+                        safe_args.append(str(arg))
+                formatted = safe_message % tuple(safe_args) if safe_args else safe_message
+                print(formatted)
+            except:
+                # Last resort: just print a safe message
+                print("[Message contains non-ASCII characters]")
+    
     def say(self, text):
         """Make NAO speak."""
-        if text is None:
-            text = "I'm sorry, I couldn't process that."
-        text = str(text).strip()
-        if not text:
-            text = "I'm sorry, I couldn't process that."
-        print("NAO: %s" % text)
-        self.tts.say(text)
+        text = self._ensure_text(text)
+        self._safe_print("NAO: %s", text)
+        # NAO TTS expects UTF-8 encoded string in Python 2
+        try:
+            # Python 2 - encode unicode to UTF-8
+            tts_text = text.encode('utf-8')
+        except (UnicodeDecodeError, AttributeError):
+            # Python 3 or already bytes
+            tts_text = text
+        self.tts.say(tts_text)
+    
+    def say_with_gestures(self, text):
+        """Make NAO speak with hand gestures."""
+        text = self._ensure_text(text)
+        self._safe_print("NAO: %s", text)
+        
+        # Estimate speaking duration for gestures
+        words = len(text.split())
+        estimated_duration = max(2.0, words / 2.5)  # Roughly 2.5 words per second
+        
+        # Start gestures in a separate thread so they happen while speaking
+        gesture_thread = threading.Thread(target=self._do_speaking_gestures, args=(estimated_duration, text))
+        gesture_thread.daemon = True
+        gesture_thread.start()
+        
+        # Start speaking (this is blocking, but gestures run in parallel)
+        # NAO TTS expects UTF-8 encoded string in Python 2
+        try:
+            # Python 2 - encode unicode to UTF-8
+            tts_text = text.encode('utf-8')
+        except (UnicodeDecodeError, AttributeError):
+            # Python 3 or already bytes
+            tts_text = text
+        self.tts.say(tts_text)
+        
+        # Wait for gestures to finish (with timeout)
+        gesture_thread.join(timeout=estimated_duration + 1.0)
+    
+    def _do_speaking_gestures(self, duration, text=""):
+        """Perform contextual hand gestures while speaking."""
+        try:
+            # Calculate number of gestures based on duration
+            gesture_count = max(1, int(duration / 1.5))  # One gesture every ~1.5 seconds
+            
+            # Determine gesture style based on content
+            text_lower = text.lower()
+            gesture_style = self._determine_gesture_style(text_lower)
+            
+            for i in range(gesture_count):
+                # Vary gestures based on style and position
+                self._perform_contextual_gesture(gesture_style, i, gesture_count)
+                
+                # Variable pause between gestures (more natural)
+                pause_time = 0.5 + (i % 3) * 0.2  # Varies between 0.5-0.9 seconds
+                time.sleep(pause_time)
+            
+            # Smooth return to neutral
+            self._return_to_neutral()
+            
+        except Exception as e:
+            print("[DEBUG] Error in hand gestures: %s" % str(e))
+            try:
+                self._return_to_neutral()
+            except:
+                pass
+    
+    def _determine_gesture_style(self, text):
+        """Determine gesture style based on content."""
+        # Question/uncertainty
+        if any(word in text for word in ['?', 'question', 'wonder', 'think', 'maybe', 'perhaps']):
+            return 'questioning'
+        # Positive/enthusiastic
+        elif any(word in text for word in ['great', 'wonderful', 'excellent', 'yes', 'sure', 'happy', 'love']):
+            return 'enthusiastic'
+        # Negative/sad
+        elif any(word in text for word in ['sorry', 'unfortunately', 'cannot', 'unable', 'no', 'sad']):
+            return 'apologetic'
+        # Explaining/listing
+        elif any(word in text for word in ['first', 'second', 'also', 'additionally', 'another', 'then']):
+            return 'explaining'
+        # Greeting/friendly
+        elif any(word in text for word in ['hello', 'hi', 'welcome', 'nice', 'pleasure']):
+            return 'welcoming'
+        # Default - conversational
+        else:
+            return 'conversational'
+    
+    def _perform_contextual_gesture(self, style, index, total):
+        """Perform a contextual gesture based on style."""
+        try:
+            # Vary which arm based on index (not just alternating)
+            use_right = (index % 3 != 1)  # More natural variation
+            
+            if style == 'questioning':
+                # Open palm gesture, slight head tilt motion
+                if use_right:
+                    self.motion.setAngles("RShoulderPitch", -0.3, 0.2)
+                    self.motion.setAngles("RShoulderRoll", -0.1, 0.2)
+                    self.motion.setAngles("RElbowRoll", 0.3, 0.2)
+                else:
+                    self.motion.setAngles("LShoulderPitch", -0.3, 0.2)
+                    self.motion.setAngles("LShoulderRoll", 0.1, 0.2)
+                    self.motion.setAngles("LElbowRoll", -0.3, 0.2)
+                time.sleep(0.4)
+                self._return_arm_neutral(use_right)
+                
+            elif style == 'enthusiastic':
+                # Upward, open gesture
+                if use_right:
+                    self.motion.setAngles("RShoulderPitch", -0.6, 0.25)
+                    self.motion.setAngles("RShoulderRoll", -0.2, 0.25)
+                else:
+                    self.motion.setAngles("LShoulderPitch", -0.6, 0.25)
+                    self.motion.setAngles("LShoulderRoll", 0.2, 0.25)
+                time.sleep(0.3)
+                # Slight wave motion
+                if use_right:
+                    self.motion.setAngles("RShoulderRoll", -0.4, 0.2)
+                    time.sleep(0.2)
+                    self.motion.setAngles("RShoulderRoll", -0.2, 0.2)
+                else:
+                    self.motion.setAngles("LShoulderRoll", 0.4, 0.2)
+                    time.sleep(0.2)
+                    self.motion.setAngles("LShoulderRoll", 0.2, 0.2)
+                time.sleep(0.2)
+                self._return_arm_neutral(use_right)
+                
+            elif style == 'apologetic':
+                # Gentle, downward gesture
+                if use_right:
+                    self.motion.setAngles("RShoulderPitch", 0.2, 0.2)
+                    self.motion.setAngles("RShoulderRoll", -0.1, 0.2)
+                else:
+                    self.motion.setAngles("LShoulderPitch", 0.2, 0.2)
+                    self.motion.setAngles("LShoulderRoll", 0.1, 0.2)
+                time.sleep(0.5)
+                self._return_arm_neutral(use_right)
+                
+            elif style == 'explaining':
+                # Pointing/indicating gesture
+                if use_right:
+                    self.motion.setAngles("RShoulderPitch", -0.2, 0.2)
+                    self.motion.setAngles("RShoulderRoll", -0.3, 0.2)
+                    self.motion.setAngles("RElbowRoll", 0.5, 0.2)
+                else:
+                    self.motion.setAngles("LShoulderPitch", -0.2, 0.2)
+                    self.motion.setAngles("LShoulderRoll", 0.3, 0.2)
+                    self.motion.setAngles("LElbowRoll", -0.5, 0.2)
+                time.sleep(0.4)
+                # Slight movement to emphasize
+                if use_right:
+                    self.motion.setAngles("RShoulderRoll", -0.4, 0.15)
+                    time.sleep(0.15)
+                    self.motion.setAngles("RShoulderRoll", -0.3, 0.15)
+                else:
+                    self.motion.setAngles("LShoulderRoll", 0.4, 0.15)
+                    time.sleep(0.15)
+                    self.motion.setAngles("LShoulderRoll", 0.3, 0.15)
+                time.sleep(0.2)
+                self._return_arm_neutral(use_right)
+                
+            elif style == 'welcoming':
+                # Open arms gesture
+                if use_right:
+                    self.motion.setAngles("RShoulderPitch", -0.4, 0.25)
+                    self.motion.setAngles("RShoulderRoll", -0.5, 0.25)
+                else:
+                    self.motion.setAngles("LShoulderPitch", -0.4, 0.25)
+                    self.motion.setAngles("LShoulderRoll", 0.5, 0.25)
+                time.sleep(0.5)
+                self._return_arm_neutral(use_right)
+                
+            else:  # conversational
+                # Natural, varied conversational gestures
+                gesture_type = index % 4
+                if gesture_type == 0:
+                    # Gentle raise
+                    if use_right:
+                        self.motion.setAngles("RShoulderPitch", -0.35, 0.22)
+                        self.motion.setAngles("RShoulderRoll", -0.15, 0.22)
+                    else:
+                        self.motion.setAngles("LShoulderPitch", -0.35, 0.22)
+                        self.motion.setAngles("LShoulderRoll", 0.15, 0.22)
+                    time.sleep(0.35)
+                    self._return_arm_neutral(use_right)
+                elif gesture_type == 1:
+                    # Side gesture
+                    if use_right:
+                        self.motion.setAngles("RShoulderPitch", 0.0, 0.2)
+                        self.motion.setAngles("RShoulderRoll", -0.4, 0.2)
+                    else:
+                        self.motion.setAngles("LShoulderPitch", 0.0, 0.2)
+                        self.motion.setAngles("LShoulderRoll", 0.4, 0.2)
+                    time.sleep(0.4)
+                    self._return_arm_neutral(use_right)
+                elif gesture_type == 2:
+                    # Forward gesture
+                    if use_right:
+                        self.motion.setAngles("RShoulderPitch", -0.25, 0.2)
+                        self.motion.setAngles("RShoulderRoll", -0.2, 0.2)
+                        self.motion.setAngles("RElbowRoll", 0.3, 0.2)
+                    else:
+                        self.motion.setAngles("LShoulderPitch", -0.25, 0.2)
+                        self.motion.setAngles("LShoulderRoll", 0.2, 0.2)
+                        self.motion.setAngles("LElbowRoll", -0.3, 0.2)
+                    time.sleep(0.4)
+                    self._return_arm_neutral(use_right)
+                else:
+                    # Subtle movement
+                    if use_right:
+                        self.motion.setAngles("RShoulderPitch", -0.2, 0.18)
+                        time.sleep(0.3)
+                    else:
+                        self.motion.setAngles("LShoulderPitch", -0.2, 0.18)
+                        time.sleep(0.3)
+                    self._return_arm_neutral(use_right)
+                    
+        except Exception as e:
+            print("[DEBUG] Error in contextual gesture: %s" % str(e))
+    
+    def _return_arm_neutral(self, is_right):
+        """Return a single arm to neutral position."""
+        try:
+            if is_right:
+                self.motion.setAngles(["RShoulderPitch", "RShoulderRoll", "RElbowRoll"], [0.0, 0.0, 0.0], 0.25)
+            else:
+                self.motion.setAngles(["LShoulderPitch", "LShoulderRoll", "LElbowRoll"], [0.0, 0.0, 0.0], 0.25)
+        except:
+            pass
+    
+    def _return_to_neutral(self):
+        """Return both arms to neutral position smoothly."""
+        try:
+            self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [0.0, 0.0], 0.3)
+            self.motion.setAngles(["LShoulderRoll", "RShoulderRoll"], [0.0, 0.0], 0.3)
+            self.motion.setAngles(["LElbowRoll", "RElbowRoll"], [0.0, 0.0], 0.3)
+        except:
+            pass
     
     def list_audio_devices(self):
         """List available audio input devices for debugging."""
@@ -371,17 +735,33 @@ class NaoAssistant:
             result = subprocess.check_output(cmd)
             
             print("[DEBUG] Whisper: Response received (%d bytes)" % len(result))
-            data = json.loads(result)
+            
+            # Decode response as UTF-8 (API returns UTF-8 encoded JSON)
+            if isinstance(result, bytes):
+                try:
+                    result_str = result.decode('utf-8')
+                except UnicodeDecodeError:
+                    # Try with errors='replace' if UTF-8 fails
+                    result_str = result.decode('utf-8', errors='replace')
+            else:
+                result_str = result
+            
+            data = json.loads(result_str)
             
             if 'text' in data:
                 transcription = data['text'].strip()
-                print("[DEBUG] Whisper: Transcription: \"%s\"" % transcription)
+                # Print transcription safely (handle non-ASCII characters)
+                self._safe_print("[DEBUG] Whisper: Transcription: \"%s\"", transcription)
                 return transcription
             elif 'error' in data:
                 print("[DEBUG] Whisper: API error: %s" % data['error'])
                 return None
             else:
-                print("[DEBUG] Whisper: Unexpected response: %s" % result[:200])
+                # Print first 200 chars safely
+                try:
+                    print("[DEBUG] Whisper: Unexpected response: %s" % result_str[:200])
+                except UnicodeEncodeError:
+                    print("[DEBUG] Whisper: Unexpected response (contains non-ASCII)")
                 return None
                 
         except subprocess.CalledProcessError as e:
@@ -432,19 +812,70 @@ class NaoAssistant:
         
         try:
             print("[DEBUG] GPT: Sending request...")
-            # Use ensure_ascii=False to preserve unicode characters, then encode to UTF-8
-            json_str = json.dumps(data, ensure_ascii=False)
-            # If it's unicode (Python 2) or str (Python 3), encode to UTF-8 bytes
-            if isinstance(json_str, unicode_type):
-                json_bytes = json_str.encode('utf-8')
-            else:
-                # Already bytes (shouldn't happen with ensure_ascii=False, but handle it)
-                json_bytes = json_str
             
+            # Helper function to ensure text is unicode (Python 2/3 compatible)
+            def to_unicode(text):
+                if text is None:
+                    return u""
+                if isinstance(text, unicode_type):
+                    return text
+                if isinstance(text, bytes):
+                    try:
+                        return text.decode('utf-8')
+                    except UnicodeDecodeError:
+                        return text.decode('utf-8', errors='replace')
+                # For Python 2 str or other types
+                try:
+                    return unicode_type(text)
+                except UnicodeDecodeError:
+                    return text.decode('utf-8', errors='replace')
+            
+            # Build messages list with proper unicode handling
+            all_messages = []
+            
+            # Add system prompt
+            all_messages.append({u"role": u"system", u"content": to_unicode(SYSTEM_PROMPT)})
+            
+            # Add conversation history
+            for msg in self.conversation_history:
+                all_messages.append({
+                    u"role": to_unicode(msg.get("role", "")),
+                    u"content": to_unicode(msg.get("content", ""))
+                })
+            
+            # Add current user message
+            all_messages.append({u"role": u"user", u"content": to_unicode(user_message)})
+            
+            # Build request data
+            cleaned_data = {
+                u"model": to_unicode(self.model),
+                u"messages": all_messages,
+                u"max_tokens": 150,
+                u"temperature": 0.7
+            }
+            
+            # Use ensure_ascii=True - this escapes all unicode as \uXXXX
+            # This is the safest approach for Python 2 compatibility
+            json_str = json.dumps(cleaned_data, ensure_ascii=True)
+            
+            # json.dumps with ensure_ascii=True returns ASCII-only str
+            # Convert to bytes for the request
+            if isinstance(json_str, bytes):
+                json_bytes = json_str
+            else:
+                json_bytes = json_str.encode('ascii')  # Safe because ensure_ascii=True
+            
+            # Headers are simple ASCII strings
+            encoded_headers = {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + str(self.api_key)
+            }
+            
+            # Create request
             request = Request(
                 OPENAI_CHAT_URL,
                 data=json_bytes,
-                headers=headers
+                headers=encoded_headers
             )
             
             response = urlopen(request, timeout=30)
@@ -459,12 +890,37 @@ class NaoAssistant:
                 if 'message' in choice:
                     content = choice['message'].get('content')
                     if content:
-                        reply = str(content).strip()
-                        print("[DEBUG] GPT: Response: \"%s\"" % reply[:50])
+                        # Ensure reply is unicode (not str in Python 2)
+                        if isinstance(content, bytes):
+                            reply = content.decode('utf-8', errors='replace').strip()
+                        elif isinstance(content, unicode_type):
+                            reply = content.strip()
+                        else:
+                            # Python 2 str or other - convert to unicode
+                            try:
+                                reply = unicode_type(content).strip()
+                            except UnicodeDecodeError:
+                                reply = content.decode('utf-8', errors='replace').strip()
                         
-                        # Update conversation history
-                        self.conversation_history.append({"role": "user", "content": user_message})
-                        self.conversation_history.append({"role": "assistant", "content": reply})
+                        # Print safely (handle console encoding issues)
+                        try:
+                            print("[DEBUG] GPT: Response: \"%s\"" % reply[:50])
+                        except UnicodeEncodeError:
+                            safe_reply = reply.encode('ascii', errors='replace').decode('ascii')
+                            print("[DEBUG] GPT: Response: \"%s\"" % safe_reply[:50])
+                        
+                        # Ensure user_message is also unicode for history
+                        if isinstance(user_message, bytes):
+                            user_message = user_message.decode('utf-8', errors='replace')
+                        elif not isinstance(user_message, unicode_type):
+                            try:
+                                user_message = unicode_type(user_message)
+                            except UnicodeDecodeError:
+                                user_message = user_message.decode('utf-8', errors='replace')
+                        
+                        # Store in conversation history as unicode
+                        self.conversation_history.append({u"role": u"user", u"content": user_message})
+                        self.conversation_history.append({u"role": u"assistant", u"content": reply})
                         
                         # Keep history manageable
                         if len(self.conversation_history) > 20:
@@ -557,7 +1013,8 @@ class NaoAssistant:
                 self.set_eye_color('white')
                 return False  # Continue conversation
             
-            print("\nYou said: \"%s\"" % transcription)
+            # Safely print transcription (may contain non-ASCII characters)
+            self._safe_print("\nYou said: \"%s\"", transcription)
             
             # Check if user wants to quit
             transcription_lower = transcription.lower().strip()
@@ -573,9 +1030,9 @@ class NaoAssistant:
             print("Getting GPT response...")
             response = self.get_gpt_response(transcription)
             
-            # Step 5: Speak the response
+            # Step 5: Speak the response with hand gestures
             self.set_eye_color('green')
-            self.say(response)
+            self.say_with_gestures(response)
             
             # Reset
             self.set_eye_color('white')
